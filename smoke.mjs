@@ -3,22 +3,37 @@
  *
  * 跑法：node smoke.mjs
  * 任何一条断言失败就非 0 退出，方便在改完插件后立刻自查。
+ *
+ * 注意：所有 DSML 样本都在运行时用 ｜ 拼出来，不在源码里写「全角竖线 + DSML」
+ * 的字面量 —— 那种字面量经过上游 tokenizer 会被换成占位符，测试会假失败。
  */
 
 import assert from 'node:assert/strict'
 import { apply, decideContinue, sanitizeText, SentinelFilter } from './index.js'
 
+/** 全角竖线 U+FF5C。 */
+const BAR = '｜'
+/** 控制令牌里的方言名，拆开写避免被当成特殊 token。 */
+const WORD = 'DSML'
+
+/** `<｜｜DSML｜｜ name>`。 */
+const openTag = (attrs) => `<${BAR}${WORD}${BAR} ${attrs}>`
+/** `</｜｜DSML｜｜ name>`。 */
+const closeTag = (name) => `</${BAR}${WORD}${BAR} ${name}>`
+/** 带参数的完整标签。 */
+const paramTag = (name, value) => `${openTag(`parameter name="${name}" string="true"`)}${value}${closeTag('parameter')}`
+
 /** 真实会话里出现过的最短形态（ASCII 竖线）。 */
 const SAFETY = '|<ds_safety>[用户未成年]否\n[分类]其他\n[判定]纯技术问题。\n[规则]无</ds_safety>|>'
 
-/** 实测泄漏的 DSML 形态：单根全角竖线（U+FF5C）+ 空格。 */
+/** 实测泄漏的 DSML 形态：单根全角竖线 + 空格。 */
 const DSML = [
-  '<｜｜DSML｜｜ calls>',
-  '<｜｜DSML｜｜ invoke name="pwsh">',
-  '<｜｜DSML｜｜ parameter name="command" string="true">Select-String -Path user\\src\\*.c</｜｜DSML｜｜ parameter>',
-  '<｜｜DSML｜｜ parameter name="description" string="true">找调用点</｜｜DSML｜｜ parameter>',
-  '</｜｜DSML｜｜ invoke>',
-  '</｜｜DSML｜｜ calls>',
+  openTag('calls'),
+  openTag('invoke name="pwsh"'),
+  paramTag('command', 'Select-String -Path user\\src\\*.c'),
+  paramTag('description', '找调用点'),
+  closeTag('invoke'),
+  closeTag('calls'),
 ].join('\n')
 
 const cases = []
@@ -84,13 +99,15 @@ test('DSML 逐字符分片与整段结果一致', async () => {
 })
 
 test('落单的 DSML 标签只删自己，周围的字不动', async () => {
-  assert.equal(sanitizeText('前</｜｜DSML｜｜ invoke>后'), '前后')
-  assert.equal(sanitizeText('前<｜｜DSML｜｜ parameter name="x">后'), '前后')
+  assert.equal(sanitizeText(`前${closeTag('invoke')}后`), '前后')
+  assert.equal(sanitizeText(`前${openTag('parameter name="x"')}后`), '前后')
 })
 
-test('双竖线与 ASCII 竖线写法也认', async () => {
-  assert.equal(sanitizeText('前<｜｜｜DSML｜｜｜ calls>后'), '前后')
-  assert.equal(sanitizeText('前<｜DSML｜ invoke name="x">后'), '前后')
+test('多根竖线与 ASCII 竖线写法也认', async () => {
+  const two = `${BAR}${BAR}${WORD}${BAR}${BAR}`
+  assert.equal(sanitizeText(`前<${two} calls>后`), '前后')
+  const ascii = `|${WORD}|`
+  assert.equal(sanitizeText(`前<${ascii} invoke name="x">后`), '前后')
 })
 
 test('正文里的普通尖括号不被误伤', async () => {
@@ -153,6 +170,31 @@ test('流被取消时扣住的尾巴会补发，不丢字', async () => {
   let out = ''
   for await (const chunk of stream) if (chunk.type === 'reasoning-delta') out += chunk.text
   assert.equal(out, '尾巴<')
+})
+
+test('少了尖括号的 DSML 残片也删掉（真实会话形态）', async () => {
+  const bare = `${BAR}${WORD}${BAR} invoke>`
+  const text = `得马上确认。\n\n${bare}\n\n让我列出目录。`
+  const want = '得马上确认。\n\n\n\n让我列出目录。'
+  assert.equal(await run(text), want)
+  assert.equal(await run(text, { size: 1 }), want)
+})
+
+test('收尾时半截的 DSML 标记当残渣丢掉', async () => {
+  assert.equal(sanitizeText(`正文<${BAR}${WORD}${BAR} inv`), '正文')
+})
+
+test('其它特殊 token（如 begin_of_sentence）也删掉', async () => {
+  // `▁` 是 tokenizer 的分词符 U+2581，运行时拼出来避免源码里出现特殊 token
+  const bos = `<${BAR}begin${String.fromCharCode(0x2581)}of${String.fromCharCode(0x2581)}sentence${BAR}>`
+  const text = `前${bos}后`
+  assert.equal(await run(text), '前后')
+  assert.equal(await run(text, { size: 1 }), '前后')
+})
+
+test('|compact]]> 上下文预算标记连同闭合标签一起删', async () => {
+  const text = '前|compact]]></custom-content></budget:token_budget>{"path":"x"}后'
+  assert.equal(await run(text), '前{"path":"x"}后')
 })
 
 test('续跑判据：只有「完成 + 泄漏 + 零产出」才续', async () => {

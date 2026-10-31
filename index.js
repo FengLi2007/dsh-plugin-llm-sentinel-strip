@@ -59,6 +59,26 @@ const DSML_DEPTH_NAMES = new Set(['tool_calls', 'tool-calls', 'toolcalls', 'invo
 const DSML_TAG_SOURCE = `<\\s*(/)?\\s*${DSML_BARS}\\s*DSML\\s*${DSML_BARS}\\s*(${DSML_NAMES})\\b[^>]*>`
 const DSML_TAG_AT = new RegExp(DSML_TAG_SOURCE, 'iy')
 const DSML_START = new RegExp(`<\\s*/?\\s*${DSML_BARS}\\s*DSML`, 'i')
+/**
+ * 少了 `<` 的残片：模型把开头截掉，只剩 `｜DSML｜ invoke>` 这种。
+ * 实测来源（会话 7bfd12c0）：一行里只有 `｜DSML｜ invoke>`，前面既没有 `<` 也没有 `/`，
+ * 但它照样会被模型当成「上一段没闭合」的证据，必须一并删掉。
+ */
+const DSML_BARE_SOURCE = `${DSML_BARS}\\s*DSML\\s*${DSML_BARS}\\s*(${DSML_NAMES})\\s*>`
+const DSML_BARE = new RegExp(DSML_BARE_SOURCE, 'i')
+/**
+ * 兜底：任何 `<｜…｜>` 形状的特殊 token，不限于 DSML 的名字清单。
+ *
+ * 实测来源（会话 31ea8e33）：模型在正文中间吐出 `<｜begin▁of▁sentence｜>` —— 这是
+ * tokenizer 的 BOS/EOS 标记，不是工具调用，但同样会被下一拍当成「没闭合」的证据。
+ * 名字清单永远追不上 tokenizer 的词表，所以再加一条形状规则。
+ */
+const SPECIAL_SOURCE = `<\\s*(?:[\\uFF5C]{1,4}|\\|{1,4})[^<>\\uFF5C|]{1,40}(?:[\\uFF5C]{1,4}|\\|{1,4})[^<>]{0,40}>`
+const SPECIAL_TOKEN = new RegExp(SPECIAL_SOURCE, 'i')
+
+/** `|compact]]>` 这一族上下文预算标记（实测 2 处），连同它的两个闭合标签一起删。 */
+const COMPACT_SOURCE = '\\|compact\\]\\]>(?:</custom-content></budget:token_budget>)?'
+const COMPACT_TOKEN = new RegExp(COMPACT_SOURCE, 'i')
 
 /** 扣住末尾多少个字符，等一个可能还没拼完的令牌（DSML 带属性可能超过 40）。 */
 const HOLD_MAX = 160
@@ -89,6 +109,18 @@ function providerAllowed(options) {
 function dsmlTagAt(text, from) {
   DSML_TAG_AT.lastIndex = from
   return DSML_TAG_AT.exec(text)
+}
+
+/** 从 `from` 起找「少了 `<` 的 DSML 残片」；落在完整标签内部的匹配要跳过。 */
+function findBareAt(text, from = 0) {
+  let cursor = from
+  for (;;) {
+    const rel = text.slice(cursor).search(DSML_BARE)
+    if (rel < 0) return -1
+    const at = cursor + rel
+    if (at === 0 || text[at - 1] !== '<') return at
+    cursor = at + 1
+  }
 }
 
 /** 从 opener 起点向后找配对的块尾；找不到返回 -1。 */
@@ -123,7 +155,14 @@ function holdBackStart(text) {
 
     if (head === '|') {
       if (TOOL_REQUEST.startsWith(suffix)) return text.length - k
+      if ('|compact]]>'.startsWith(suffix)) return text.length - k
       if (/^\|(<[a-z_]{0,19})?$/.test(suffix)) return text.length - k
+      // 少了尖括号的残片：`|DSML| invoke>` 还没写完
+      if (!suffix.includes('>') && /^\|+D/i.test(suffix)) return text.length - k
+      continue
+    }
+    if (head === '｜') {
+      if (!suffix.includes('>') && (suffix.length <= 8 || /^｜+D/i.test(suffix))) return text.length - k
       continue
     }
     if (head === '[') {
@@ -196,19 +235,25 @@ export class SentinelFilter {
 
     for (;;) {
       const dsmlAt = rest.search(DSML_START)
+      const bareAt = findBareAt(rest)
       const openAt = rest.search(OPEN_RE)
       const altAt = rest.indexOf(ALT_OPEN)
       const toolAt = rest.indexOf(TOOL_REQUEST)
       const closeAt = rest.search(CLOSE_RE)
+      const specialAt = rest.search(SPECIAL_TOKEN)
+      const compactAt = rest.search(COMPACT_TOKEN)
 
       let at = -1
       let kind = ''
       for (const [candidateAt, candidateKind] of [
         [dsmlAt, 'dsml'],
+        [bareAt, 'bare'],
         [openAt, 'open'],
         [altAt, 'alt'],
         [toolAt, 'tool'],
         [closeAt, 'close'],
+        [specialAt, 'special'],
+        [compactAt, 'compact'],
       ]) {
         if (candidateAt < 0) continue
         if (at < 0 || candidateAt < at) {
@@ -229,7 +274,9 @@ export class SentinelFilter {
             return out
           }
           this.#leak = true
-          rest = rest.slice(at + 1)
+          // 收尾还是半截：有 `>` 就丢到它为止，没有就把剩下的当残渣
+          const gt = rest.indexOf('>', at)
+          rest = rest.slice(gt >= 0 ? gt + 1 : rest.length)
           continue
         }
         const closing = tag[1] === '/'
@@ -255,6 +302,26 @@ export class SentinelFilter {
         continue
       }
 
+      if (kind === 'bare') {
+        // 少了 `<` 的残片：整颗标签删掉
+        const match = DSML_BARE.exec(rest.slice(at))
+        this.#leak = true
+        rest = rest.slice(at + match[0].length)
+        continue
+      }
+      if (kind === 'special') {
+        // `<｜…｜>` 形状的任何特殊 token（如 `<｜begin_of_sentence｜>`）
+        const match = SPECIAL_TOKEN.exec(rest.slice(at))
+        this.#leak = true
+        rest = rest.slice(at + match[0].length)
+        continue
+      }
+      if (kind === 'compact') {
+        const match = COMPACT_TOKEN.exec(rest.slice(at))
+        this.#leak = true
+        rest = rest.slice(at + match[0].length)
+        continue
+      }
       if (kind === 'tool') {
         this.#leak = true
         rest = rest.slice(at + TOOL_REQUEST.length)
