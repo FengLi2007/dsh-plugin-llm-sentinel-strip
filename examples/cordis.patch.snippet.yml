@@ -1,0 +1,14 @@
+# 把下面这段追加到 cordis.patch.yml 末尾（与 plugins/ 同级）。
+#
+# cordis.patch.yml 是一个顶层 YAML 数组，每一项是 id-targeted 覆盖、disable 或
+# insert 列表。这里的 insert 只是把插件挂进 profile，不改任何路由配置。
+#
+# 默认只清洗 aliyun（百炼）路由。要全量清洗：
+#   PowerShell  $env:DSH_SENTINEL_STRIP_PROVIDERS = '*'
+#   或 'aliyun,qwen3.7-plus' 这样的逗号列表。
+#
+# 回退：把本段注释掉即可。
+
+- insert:
+    - id: llm-sentinel-strip
+      name: './plugins/llm-sentinel-strip/index.js'

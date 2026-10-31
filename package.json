@@ -1,0 +1,25 @@
+{
+  "name": "dsh-plugin-llm-sentinel-strip",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Strip DeepSeek-internal control sentinels (|<tag>…</tag>|>, |tool_request|>) that the DashScope anthropic-messages route leaks into the thinking stream, before they reach session history",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FengLi2007/dsh-plugin-llm-sentinel-strip.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dashscope",
+    "aliyun-bailian",
+    "cordis",
+    "plugin",
+    "reasoning-loop"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node smoke.mjs"
+  }
+}
