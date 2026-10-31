@@ -1,43 +1,73 @@
 # dsh-plugin-llm-sentinel-strip
 
-> 把 DashScope（阿里云百炼）`anthropic-messages` 路由漏进思考流的模型内部令牌剥掉，
-> 阻止 DeepSeek Harness 的思考链退化成无限复读。
-
-一个 [dsh](https://github.com/deepseek-ai/deepseek-harness)（DeepSeek Harness）插件，
-挂在 `llm/stream` waterfall 上，改的是**写进 session log 之前**的分片，所以历史天然干净喵。
+> 把 DeepSeek 的内部令牌（DSML 工具调用标记、`|<ds_safety>…</ds_safety>|>` 这类审查标记）
+> 从思考流里剥掉，并在「漏到整轮什么都没产出」时自动补一条「继续」。
+>
+> 一个 [dsh](https://github.com/deepseek-ai/deepseek-harness)（DeepSeek Harness）插件，
+> 挂在 `llm/stream` waterfall 上，改的是**写进 session log 之前**的分片，所以历史天然干净喵。
 
 ---
 
 ## 解决什么问题
 
-把 dsh 的模型路由切到百炼（`https://dashscope.aliyuncs.com/apps/anthropic`）之后，
-思考流里会混进这样的东西：
+DeepSeek-V4.1 的原生工具调用协议是 **DSML**：
 
 ```
-</calls> |<ds_safety>[用户未成年]否
-[分类]其他
-[判定]用户询问智能车代码中滑行减速标定模式的设计与实现，属于嵌入式控制与软件工程的技术讨论，不涉及政治敏感内容。
-[规则]无</ds_safety>|>Since the previous message was malformed, let me re-read the page block properly.
+<｜｜DSML｜｜ calls>
+<｜｜DSML｜ invoke name="pwsh">
+<｜｜DSML｜ parameter name="command" string="true">Select-String -Path user\src\*.c</｜｜DSML｜｜ parameter>
+</｜｜DSML｜ invoke>
+</｜ calls>
 ```
 
-这些标记一旦被记录进历史，模型下一拍会把末尾的 `|>` 当成「上一段没闭合」的分隔符，
-于是把同一段工具调用重写一遍，再重写一遍 —— 思考越滚越长，用户看到的就是
-**「卡在思考链里循环输出」**。
+（`｜` 是全角竖线 U+FF5C，模型有时写一根、有时连着写三根。）
 
-实测（同一套系统提示词与工具定义）：
+官方的 `dsh-llm-deepseek` 适配器认得这套方言，把它转成真正的 tool call。
+**非原生的 provider 路由（例如阿里云百炼的 anthropic-messages 兼容端点）不认**，
+于是这段标记原样留在 reasoning 里，harness 没有执行任何工具，模型等不到结果，
+就把同一段重写一遍 —— 用户看到的就是**「卡在思考链里无限循环输出」**。
 
-| 路由 | 助手消息 | 含 `ds_safety` | 最长单步思考 | 同句重复 |
-|---|---|---|---|---|
-| `deepseek-official/deepseek-flash` | 331 | **0** | 26K 字符 | 1~2 次 |
-| `aliyun/deepseek-v4.1-flash` | 96 | **22**（共 1033 个标签） | **117,407 字符** | **167 次** |
+实测对比（同一套系统提示词与工具定义，2026-10-31）：
 
-泄漏的不只是 `ds_safety` —— 同一个流里还有 `|tool_request|>{...}` 和
-`|compact]]></custom-content></budget:token_budget>`，说明是**整套内部令牌没被服务端剥掉**，
-而不是某一次审查注入了什么。
+| 指标 | `deepseek-official/deepseek-flash` | `aliyun/deepseek-v4.1-flash` |
+|---|---|---|
+| 助手消息 | 331 | 96 |
+| DSML 标记 | **0** | **4551** |
+| 工具调用 | 375 次，0 丢失 | 107 次，**8 个步骤整轮丢失** |
+| 单步最长思考 | 26K 字符 | **117,407 字符 / 同句重复 167 次** |
 
-> 注意：这个现象是**条件触发**的。短请求直连该端点复现不出来（实测两次探测都是 0），
-> 第一次出现在切换路由后的第 21 条消息、模型在思考里写坏一次工具调用之后。
-> 所以不要用「发一条短消息没复现」来否定它。
+> 最狠的一步：37,655 字符的思考里 298 个 DSML 标记、0 个真实 tool call ——
+> 这一轮什么也没产出，用户只看到屏幕在刷同样的闭合标签。
+
+**根本解法是别把 DeepSeek 模型放在不认 DSML 的路由上**（官方路由同样是 1M 上下文）。
+本插件是给「必须留在那条路由上」的场景兜底的喵。
+
+---
+
+## 它做两件事
+
+### ① 剥离
+
+`llm/stream` 钩子，`text` 和 `reasoning` **两条通道都清**：
+
+| 形态 | 处理 |
+|---|---|
+| `<｜｜DSML｜｜ calls> … </｜｜DSML｜｜ calls>`（含 `invoke` / `tool_calls` 等，可嵌套） | 按标签深度配对，整块摘掉 |
+| `<｜｜DSML｜｜ parameter …>`、落单的 `</｜｜DSML｜ invoke>`、光头 `<｜｜DSML｜｜>` | 只删标签本身，周围的字保留 |
+| `\|<ds_safety>…</ds_safety>\|>` / `\|tool_request\|>` 这类安全标记 | 整段摘掉 |
+| 开标签被写坏的畸形块（只剩 `[用户未成年]…</ds_safety>\|>`） | 按内容特征兜底摘掉 |
+
+竖线写法实测见到三种（`｜`、`｜｜`、`|`），根数不固定，插件按「任意根」匹配 ——
+这也是市面上几个同类插件失效的地方：有的只认单竖线，有的一律要求双竖线。
+
+### ② 续跑
+
+只在**这一轮确实什么都没产出**时补一条「继续」，避免你盯着卡死的界面手动敲字：
+
+- 条件：`turn/end` 是 `completed` **且** 这一轮剥到过令牌 **且** 没有任何 tool call 与非空白正文；
+- 不续：`aborted` / `interrupted`、非 `completed` 的任何结束方式；
+- 上限：连续 3 次后停下等人（你一旦自己说话，计数清零、待发的续跑取消）；
+- 投递走 `agent.followup()`，消息来源标记为 `plugin:llm-sentinel-strip`，不会和你的输入混淆。
 
 ---
 
@@ -49,7 +79,7 @@
    ~/.dsh/profiles/<profile>/plugins/llm-sentinel-strip/
    ```
 
-2. 在同目录的 `cordis.patch.yml` 末尾加一条 insert（完整示例见
+2. 在同目录的 `cordis.patch.yml` 末尾加一条 insert（示例见
    [`examples/cordis.patch.snippet.yml`](examples/cordis.patch.snippet.yml)）：
 
    ```yaml
@@ -62,42 +92,22 @@
 
 回退：把上面那段 insert 注释掉即可，路由配置一个字都不用动。
 
-> `name` 是相对 `cordis.patch.yml` 所在目录的路径；用绝对 `file://` URL 也可以。
-
 ---
 
 ## 配置
 
 | 环境变量 | 默认值 | 含义 |
 |---|---|---|
-| `DSH_SENTINEL_STRIP_PROVIDERS` | `aliyun` | 要清洗的 provider 路由，逗号分隔；`*` 表示全部 |
+| `DSH_SENTINEL_STRIP_PROVIDERS` | `aliyun` | 要处理的 provider 路由，逗号分隔；`*` 表示全部 |
 
-默认只清 `aliyun`：官方路由实测从没漏过令牌，没必要动它的内容。
-如果你也走别的兼容网关，可以设成 `aliyun,qwen3.7-plus` 或者 `*`。
+默认只处理 `aliyun`：官方路由实测从没漏过令牌，没必要动它。
+如果你也走别的兼容网关，设成 `aliyun,siliconflow` 或 `*`：
 
 ```powershell
 $env:DSH_SENTINEL_STRIP_PROVIDERS = '*'
 ```
 
----
-
-## 剥什么、不剥什么
-
-剥四种形态，按出现位置先后来处理，保证不会把正常正文当令牌吞掉：
-
-| 形态 | 例子 | 处理 |
-|---|---|---|
-| 配对块 | `\|<ds_safety>…</ds_safety>\|>` | 配对成功才整段删 |
-| 畸形块 | `[用户未成年]否 … </ds_safety>\|>`（开标签被模型写坏） | 按内容特征兜底整段删 |
-| 自闭合标记 | `\|tool_request\|>` | 只删标记本身 |
-| 落单结束符 | `</ds_safety>\|>` | 只删结束符 |
-
-**不处理**：
-
-- `|compact]]></custom-content></budget:token_budget>` 这类不带 `|<tag>` 结构的泄漏
-  （实测只有 2 处，且不像 `|>` 那样诱发复读）；
-- 工具参数（`tool-call-delta`）里出现的令牌 —— 那是 JSON，盲删会破坏工具调用；
-- `|tool_request|>` 后面的幽灵 JSON，当普通正文留着。
+续跑文案固定为「继续」，连续上限 3 次，写在 `index.js` 的 `CONTINUE_TEXT` / `MAX_CONSECUTIVE`。
 
 ---
 
@@ -111,16 +121,16 @@ return this.ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(
 ```
 
 所以在这里改过的分片才会成为历史。改 UI 只影响显示，改回放只影响下一次请求，
-模型照样能读到自己上一轮漏出来的标记，照样复读。
+模型照样能读到自己上一轮漏出来的标记。
 
 另一个必须注意的点：**`delta` 和 `block-end` 两边都要改**。
 `BlockAssembler` 收到 `block-end` 时会用 `chunk.block` 覆盖掉逐片累加的结果
-（`dsh-llm/lib/index.js` 里的 `case "block-end"`），只改 delta 等于白改。
+（`dsh-llm/lib/index.js` 的 `case "block-end"`），只改 delta 等于白改。
 
 流式实现上还有两个细节：
 
-- 一个令牌可能横跨三四个 delta，所以末尾要扣住最多 40 个字符，等它拼完 ——
-  正文里的普通竖线（markdown 表格、命令行管道）最多被延迟一个分片，不会丢；
+- 一个令牌可能横跨好几个 delta，所以末尾要扣住最多 160 个字符等它拼完 ——
+  普通尖括号与竖线最多被延迟一个分片，不会丢；
 - 流被取消、走不到 `block-end` 时，把扣住的尾巴补发出去，不丢字。
 
 ---
@@ -131,29 +141,31 @@ return this.ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(
 node smoke.mjs
 ```
 
-10 条本地断言，不连模型、不开 dsh、不读任何会话文件：
+15 条本地断言，不连模型、不开 dsh、不读任何会话文件：
 
-- 普通文本（含 markdown 表格竖线）原样通过；
-- 四种令牌形态各自被剥干净；
+- 普通文本（含 markdown 表格竖线、`<stdio.h>` 这类普通尖括号）原样通过；
+- DSML 整块 / 落单标签 / 单双三竖线 / ASCII 竖线全被剥干净；
+- 安全标记与畸形块被剥干净；
 - **逐字符分片**与整段处理结果完全一致；
 - `block-end` 里的完整块也被清洗；
-- 非 `aliyun` 路由不碰内容；
-- 流被取消时尾巴补发。
+- 非目标路由不碰内容；
+- 流被取消时尾巴补发；
+- 续跑判据的六种分支。
 
-用真实数据验证过：72 个思考块里 23 个被改，`ds_safety` 从 **1033 → 0**，
-剥掉 50,814 字符，剩余 `</tag>|>` 为 0，最大一块 117,407 字符的整段清洗与
-7 字符分片流结果完全一致。
+真实数据验证（一个 74 条助手消息的会话）：78 个文本/思考块里 6 个被改，
+DSML 标记 **999 → 0**，剥掉 45,474 字符，最大一块 37,655 → 21,925，
+5 字符分片流与整段结果逐字节一致。
 
 ---
 
 ## 兼容性
 
-- 适配 dsh `0.2.1-rc.3`（`@deepseek-ai/dsh-llm` 的 `llm/stream` waterfall、
-  `StreamChunk` 协议）。
-- 只用 `ctx.on()` 和 `StreamChunk` 的公开字段，不 import 任何 dsh 内部模块。
-- 单文件、零依赖、无网络、无文件读写 —— 只做字符串变换。
+- 适配 dsh `0.2.1-rc.2` / `0.2.1-rc.3`（`llm/stream` waterfall、`session/event`、
+  `ctx.agents.get(id).followup()`）。
+- 只用 `ctx.on` / `ctx.effect` / `ctx.agents` / `StreamChunk` 的公开字段，不 import dsh 内部模块。
+- 单文件、零依赖、无网络、无文件读写。
 
-dsh 升级后如果 waterfall 改名或 `StreamChunk` 字段变了，需要跟着调整。
+dsh 升级后如果 waterfall 或事件名变了，需要跟着调整。
 
 ---
 
