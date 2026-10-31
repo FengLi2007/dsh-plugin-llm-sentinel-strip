@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-llm-sentinel-strip",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "Strip DeepSeek control tokens (DSML tool-call markup, |<tag>…</tag>|> safety markers) that non-native provider routes leak into the thinking stream, and auto-continue turns that leaked so hard they produced nothing",

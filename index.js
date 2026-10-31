@@ -47,12 +47,19 @@ const DEFAULT_PROVIDERS = 'aliyun'
 const TOOL_REQUEST = '|tool_request|>'
 const ALT_OPEN = '[用户未成年]'
 const ALT_CLOSE = '</ds_safety>|>'
-const OPEN_RE = /\|<[a-z_]{1,20}>/
-const CLOSE_RE = /<\/([a-z_]{1,20})>\|>/
+const OPEN_RE = /\|<[a-z_]{1,20}>/i
+const CLOSE_RE = /<\/([a-z_]{1,20})>\|>/i
+/**
+ * 丢了竖线的裸 XML 标签：`</invoke>` / `</parameter>` 这种。
+ *
+ * 实测来源（会话 d6660657）：清洗后仍残留 1,589 个裸闭标签 —— 模型有些回合
+ * 干脆不写竖线，只写普通 XML。留着它们下一轮照样会把模型带回「没闭合」的状态。
+ */
+const BARE_XML_TAG = /<\/?\s*(invoke|parameter|calls|tool_calls|function_calls)(?:\s[^<>]*)?>/i
 
 // ── DSML 标记（竖线写法：全角 ｜ / ASCII |，根数不定）──────────────────────
 // 实测见到单根、也见到过连着的三根（模型把分隔符写重复了），所以不假设 1~2 根。
-const DSML_BARS = '(?:[\\uFF5C]+|\\|+)'
+const DSML_BARS = '(?:[\\uFF5C]{1,64}|\\|{1,64})'
 const DSML_NAMES = 'tool_calls|tool-calls|toolcalls|invoke|parameter|calls|tool'
 /** 只有这几种参与「块」的深度配对；parameter 在块内部，不改变深度。 */
 const DSML_DEPTH_NAMES = new Set(['tool_calls', 'tool-calls', 'toolcalls', 'invoke', 'calls'])
@@ -79,6 +86,8 @@ const SPECIAL_TOKEN = new RegExp(SPECIAL_SOURCE, 'i')
 /** `|compact]]>` 这一族上下文预算标记（实测 2 处），连同它的两个闭合标签一起删。 */
 const COMPACT_SOURCE = '\\|compact\\]\\]>(?:</custom-content></budget:token_budget>)?'
 const COMPACT_TOKEN = new RegExp(COMPACT_SOURCE, 'i')
+/** 和上面配套的两个闭标签；它们也可能因为分片先到而被单独留下。 */
+const COMPACT_CLOSER = /<\/(?:custom-content|budget:token_budget)>/i
 
 /** 扣住末尾多少个字符，等一个可能还没拼完的令牌（DSML 带属性可能超过 40）。 */
 const HOLD_MAX = 160
@@ -113,6 +122,7 @@ function dsmlTagAt(text, from) {
 
 /** 从 `from` 起找「少了 `<` 的 DSML 残片」；落在完整标签内部的匹配要跳过。 */
 function findBareAt(text, from = 0) {
+  if (!text.includes('DSML')) return -1
   let cursor = from
   for (;;) {
     const rel = text.slice(cursor).search(DSML_BARE)
@@ -175,9 +185,12 @@ function holdBackStart(text) {
     if (!suffix.includes('>')) {
       if (k <= 3) return text.length - k
       if (suffix.includes('｜') || suffix.includes('|')) return text.length - k
+      // 裸 XML 标签的半截：`<inv`、`</inv`、`<parameter name="x"` …
+      if (/^<\s*\/?\s*[a-z_]*(\s[^<>]*)?$/i.test(suffix)) return text.length - k
     }
-    // 裸闭合符前缀：`</`、`</ds_safety>|` …
+    // 裸闭合符前缀：`</`、`</ds_safety>|`、`</custom-content>` …
     if (/^<\/([a-z_]{0,19})?(>(\|(>)?)?)?$/.test(suffix)) return text.length - k
+    if ('</custom-content>'.startsWith(suffix) || '</budget:token_budget>'.startsWith(suffix)) return text.length - k
   }
   return text.length
 }
@@ -240,6 +253,8 @@ export class SentinelFilter {
       const altAt = rest.indexOf(ALT_OPEN)
       const toolAt = rest.indexOf(TOOL_REQUEST)
       const closeAt = rest.search(CLOSE_RE)
+      const bareXmlAt = rest.search(BARE_XML_TAG)
+      const compactCloserAt = rest.search(COMPACT_CLOSER)
       const specialAt = rest.search(SPECIAL_TOKEN)
       const compactAt = rest.search(COMPACT_TOKEN)
 
@@ -252,6 +267,8 @@ export class SentinelFilter {
         [altAt, 'alt'],
         [toolAt, 'tool'],
         [closeAt, 'close'],
+        [bareXmlAt, 'bareXml'],
+        [compactCloserAt, 'compactCloser'],
         [specialAt, 'special'],
         [compactAt, 'compact'],
       ]) {
@@ -305,6 +322,19 @@ export class SentinelFilter {
       if (kind === 'bare') {
         // 少了 `<` 的残片：整颗标签删掉
         const match = DSML_BARE.exec(rest.slice(at))
+        this.#leak = true
+        rest = rest.slice(at + match[0].length)
+        continue
+      }
+      if (kind === 'bareXml') {
+        // 丢了竖线的裸 XML 标签（`</invoke>` 这类）
+        const match = BARE_XML_TAG.exec(rest.slice(at))
+        this.#leak = true
+        rest = rest.slice(at + match[0].length)
+        continue
+      }
+      if (kind === 'compactCloser') {
+        const match = COMPACT_CLOSER.exec(rest.slice(at))
         this.#leak = true
         rest = rest.slice(at + match[0].length)
         continue
@@ -386,7 +416,7 @@ export class SentinelFilter {
  */
 export function sanitizeText(text) {
   if (typeof text !== 'string' || text.length === 0) return text
-  if (!text.includes('|') && !text.includes('｜') && !text.includes('[用户未成年]')) return text
+  if (!text.includes('|') && !text.includes('｜') && !text.includes('<') && !text.includes('[用户未成年]')) return text
   const filter = new SentinelFilter()
   return filter.push(text) + filter.flush()
 }
@@ -474,14 +504,20 @@ function stripStream(stream, state) {
         }
         case 'block-end': {
           const filter = filters.get(chunk.index)
-          if (filter?.leak) state.leak = true
-          filters.delete(chunk.index)
+          if (filter !== undefined) {
+            // 把扣住的尾巴走一遍 done 分支，未闭合的令牌也在这里计入 leak
+            filter.flush()
+            if (filter.leak) state.leak = true
+            filters.delete(chunk.index)
+          }
           blockTypes.delete(chunk.index)
           const block = chunk.block
+          if (block?.type === 'tool-call') state.hadOutput = true
           if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string') {
             const clean = sanitizeText(block.text)
             if (block.type === 'text' && /\S/.test(clean)) state.hadOutput = true
             if (clean !== block.text) {
+              state.leak = true
               yield { ...chunk, block: { ...block, text: clean } }
               break
             }
@@ -533,6 +569,8 @@ export function apply(ctx) {
   ctx.effect(() =>
     ctx.on('llm/stream', (options, next) => {
       const stream = next()
+      // 辅助请求（标题生成、摘要压缩）也会带 sessionId，别让它们污染续跑状态
+      if (options?.purpose !== undefined) return stream
       if (!providerAllowed(options)) return stream
       const sessionId = options?.sessionId
       if (sessionId === undefined) return stripStream(stream, { leak: false, hadOutput: false })
@@ -544,15 +582,28 @@ export function apply(ctx) {
     ctx.on('session/event', (session, event) => {
       const sessionId = session?.id ?? session?.sessionId
       if (sessionId === undefined) return
+      // 子代理会话不替它续跑：它们有自己的回合语义，硬续只会和父会话打架
+      if ((session?.header?.delegationDepth ?? 0) > 0) return
+      if ((session?.delegationDepth ?? 0) > 0) return
       const state = stateOf(sessionId)
+
+      if (event.type === 'session/disposed') {
+        if (state.timer !== null) clearTimeout(state.timer)
+        sessions.delete(sessionId)
+        return
+      }
 
       if (event.type === 'user/message') {
         if (event.data?.source?.kind === PLUGIN_SOURCE_KIND) return
+        // 只有真人输入才清计数；runtime-context / skill-catalog 这类注入上下文不算，
+        // 否则每回合插一条就能把「连续 3 次」的上限旁路掉
+        if (event.data?.source?.kind !== 'user') return
         if (state.timer !== null) {
           clearTimeout(state.timer)
           state.timer = null
         }
         state.consecutive = 0
+        resetTurn(state)
         return
       }
 
@@ -566,7 +617,9 @@ export function apply(ctx) {
 
       state.consecutive += 1
       const attempt = state.consecutive
-      const delay = 1000 + Math.floor(Math.random() * 1000)
+      const delay = Number(process.env.DSH_SENTINEL_CONTINUE_DELAY_MS ?? '') || 1000 + Math.floor(Math.random() * 1000)
+      // 旧计时器没触发前又来一个 turn/end 时，先清掉，避免同一会话挂两个
+      if (state.timer !== null) clearTimeout(state.timer)
       ctx.logger?.info?.(`llm-sentinel-strip: ${sessionId} 第 ${attempt}/${MAX_CONSECUTIVE} 次续跑（${verdict.why}）`)
 
       state.timer = setTimeout(() => {
@@ -575,6 +628,7 @@ export function apply(ctx) {
           const agent = ctx.agents.get(sessionId)
           if (agent === undefined || agent === null) {
             ctx.logger?.warn?.(`llm-sentinel-strip: 会话 ${sessionId} 已无 agent，跳过续跑`)
+            resetTurn(state)
             return
           }
           agent.followup(createFollowupMessage(CONTINUE_TEXT))

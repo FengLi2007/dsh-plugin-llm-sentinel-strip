@@ -36,6 +36,9 @@ const DSML = [
   closeTag('calls'),
 ].join('\n')
 
+/** 续跑定时器缩短到固定 20ms，测试不用等 1~2 秒。 */
+process.env.DSH_SENTINEL_CONTINUE_DELAY_MS = '20'
+
 const cases = []
 
 function test(label, fn) {
@@ -45,16 +48,18 @@ function test(label, fn) {
 /** 用假 ctx 抓住两个监听器。apply 需要 effect/on/agents/logger。 */
 function harness() {
   const listeners = new Map()
+  const calls = []
   apply({
     on: (event, fn) => listeners.set(event, fn),
     effect: (fn) => {
       fn()
     },
-    agents: { get: () => undefined },
+    agents: { get: () => ({ followup: (message) => calls.push(message) }) },
     logger: { info() {}, warn() {}, error() {} },
   })
   assert.equal(typeof listeners.get('llm/stream'), 'function', 'apply 应当注册 llm/stream')
   assert.equal(typeof listeners.get('session/event'), 'function', 'apply 应当注册 session/event')
+  listeners.calls = calls
   return listeners
 }
 
@@ -80,7 +85,8 @@ test('普通文本原样通过（含 markdown 表格竖线）', async () => {
 
 test('ds_safety 整块删掉，前后正文保留', async () => {
   const text = 'let me redo the call.\n</calls> ' + SAFETY + 'Since the previous message was malformed, re-read it.'
-  const want = 'let me redo the call.\n</calls> Since the previous message was malformed, re-read it.'
+  // 裸 XML 标签（`</calls>`）也在剥离范围内，属于同一族的残留
+  const want = 'let me redo the call.\n Since the previous message was malformed, re-read it.'
   assert.equal(await run(text), want)
 })
 
@@ -126,7 +132,8 @@ test('没闭合的令牌：丢开标签、保留正文', async () => {
 
 test('开标签写坏的畸形块整段删掉（真实会话形态）', async () => {
   const text = '前<parameter name="x">y</parameter></ invoke>\n</ calls> [用户未成年]否\n[分类]其他\n<规则>无</ds_safety>|>后'
-  const want = '前<parameter name="x">y</parameter></ invoke>\n</ calls> 后'
+  // 裸 XML 标签与畸形安全块都在剥离范围内，只剩中间的 y 和标签之间的空白
+  const want = '前y\n 后'
   assert.equal(sanitizeText(text), want)
   const filter = new SentinelFilter()
   let streamed = ''
@@ -195,6 +202,51 @@ test('其它特殊 token（如 begin_of_sentence）也删掉', async () => {
 test('|compact]]> 上下文预算标记连同闭合标签一起删', async () => {
   const text = '前|compact]]></custom-content></budget:token_budget>{"path":"x"}后'
   assert.equal(await run(text), '前{"path":"x"}后')
+})
+
+test('|compact]]> 跨分片时与整段清洗一致', async () => {
+  const text = '前|compact]]></custom-content></budget:token_budget>后'
+  const whole = await run(text)
+  const split = await run(text, { size: 5 })
+  assert.equal(split, whole)
+  assert.equal(whole, '前后')
+})
+
+test('丢了竖线的裸 </invoke> 也删掉', async () => {
+  assert.equal(await run('前</invoke>后'), '前后')
+  assert.equal(await run('<invoke name="x">y</invoke>', { size: 1 }), 'y')
+})
+
+test('block-end 才暴露的泄漏也会触发续跑', async () => {
+  const listeners = harness()
+  const unclosed = `前言<${BAR}${WORD}${BAR} calls>`
+  async function* source() {
+    yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+    yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: unclosed } }
+    yield { type: 'finish', reason: 'stop' }
+  }
+  const stream = listeners.get('llm/stream')({ provider: 'aliyun', model: 'x', sessionId: 'S' }, source)
+  for await (const _ of stream) {
+    // 消费完
+  }
+  listeners.get('session/event')({ id: 'S' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(listeners.calls.length, 1, '未闭合令牌在 block-end 被删，应当补一次「继续」')
+})
+
+test('辅助请求（purpose）不污染续跑状态', async () => {
+  const listeners = harness()
+  const unclosed = `前言<${BAR}${WORD}${BAR} calls>`
+  async function* source() {
+    yield { type: 'reasoning-delta', index: 0, text: unclosed }
+  }
+  const stream = listeners.get('llm/stream')({ provider: 'aliyun', model: 'x', sessionId: 'S', purpose: 'session-title' }, source)
+  for await (const _ of stream) {
+    // 消费完
+  }
+  listeners.get('session/event')({ id: 'S' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(listeners.calls.length, 0, '标题/压缩这类辅助请求不该触发续跑')
 })
 
 test('续跑判据：只有「完成 + 泄漏 + 零产出」才续', async () => {

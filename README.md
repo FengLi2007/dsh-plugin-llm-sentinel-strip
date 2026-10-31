@@ -55,6 +55,7 @@ DeepSeek-V4.1 的原生工具调用协议是 **DSML**：
 | `<｜｜DSML｜｜ calls> … </｜｜DSML｜｜ calls>`（含 `invoke` / `tool_calls` 等，可嵌套） | 按标签深度配对，整块摘掉 |
 | `<｜｜DSML｜｜ parameter …>`、落单的 `</｜｜DSML｜ invoke>`、光头 `<｜｜DSML｜｜>` | 只删标签本身，周围的字保留 |
 | 少了尖括号的 DSML 残片（模型把开头截掉，只剩 `DSML … invoke>`） | 只删残片本身 |
+| 丢了竖线的裸 XML 标签（`</invoke>` / `</parameter>` 这种） | 只删标签本身 |
 | 其它被竖线包裹的特殊 token（如 tokenizer 的 `begin_of_sentence` 标记） | 按形状兜底删掉 |
 | `\|compact]]></custom-content></budget:token_budget>` 上下文预算标记 | 连同两个闭合标签一起删 |
 | `\|<ds_safety>…</ds_safety>\|>` / `\|tool_request\|>` 这类安全标记 | 整段摘掉 |
@@ -144,7 +145,7 @@ return this.ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(
 node smoke.mjs
 ```
 
-19 条本地断言，不连模型、不开 dsh、不读任何会话文件：
+23 条本地断言，不连模型、不开 dsh、不读任何会话文件：
 
 - 普通文本（含 markdown 表格竖线、`<stdio.h>` 这类普通尖括号）原样通过；
 - DSML 整块 / 落单标签 / 多根竖线 / ASCII 竖线全被剥干净；
@@ -156,9 +157,9 @@ node smoke.mjs
 - 流被取消时尾巴补发；
 - 续跑判据的六种分支。
 
-真实数据验证（17 个会话 / 1203 个文本与思考块，2026-10-31）：33 个块被改，
-剥掉 **314,663 字符**；清洗后 DSML、竖线类特殊 token、`|compact]]>`、安全标记
-残留全部为 **0**。单会话抽样：74 条助手消息里 DSML 标记 **999 → 0**，
+真实数据验证（17 个会话 / 1203 个非空文本与思考块，2026-10-31）：33 个块被改，
+剥掉 **347,905 字符**；清洗后 DSML、竖线类特殊 token、裸 XML 标签、`|compact]]>`、
+安全标记残留全部为 **0**。单会话抽样：74 条助手消息里 DSML 标记 **999 → 0**，
 最大一块 37,655 → 21,925，5 字符分片流与整段结果逐字节一致。
 
 ---
